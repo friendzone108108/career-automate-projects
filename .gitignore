@@ -53,3 +53,8 @@ htmlcov/
 
 # GitHub Private Key (if downloaded)
 *.pem
+
+# AWS SAM Build Artifacts
+.aws-sam/
+samconfig.toml
+parameters.json

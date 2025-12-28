@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: GitHub Sync Service - CareerAutomate
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.11
+    MemorySize: 512
+
+Parameters:
+  SupabaseUrl:
+    Type: String
+    Description: Supabase project URL
+  SupabaseKey:
+    Type: String
+    NoEcho: true
+  JwtSecret:
+    Type: String
+    NoEcho: true
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GitHubAppId:
+    Type: String
+  GitHubClientId:
+    Type: String
+  GitHubClientSecret:
+    Type: String
+    NoEcho: true
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+  FrontendUrl:
+    Type: String
+    Default: https://career-automate.vercel.app
+
+Resources:
+  GitHubSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: github-sync-service
+      Handler: main.handler
+      CodeUri: ./
+      Description: GitHub Sync Service for CareerAutomate
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_KEY: !Ref SupabaseKey
+          JWT_SECRET: !Ref JwtSecret
+          DEV_GEMINI_API_KEY: !Ref GeminiApiKey
+          GROQ_API_KEY: !Ref GroqApiKey
+          GITHUB_APP_ID: !Ref GitHubAppId
+          GITHUB_CLIENT_ID: !Ref GitHubClientId
+          GITHUB_CLIENT_SECRET: !Ref GitHubClientSecret
+          GITHUB_WEBHOOK_SECRET: !Ref GitHubWebhookSecret
+          FRONTEND_URL: !Ref FrontendUrl
+          # SERVICE_URL is set dynamically based on the API event
+      Events:
+        CatchAll:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+        Root:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  WebhookUrl:
+    Description: GitHub Webhook URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/v1/github/webhook"
+  OAuthCallbackUrl:
+    Description: GitHub OAuth Callback URL  
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/v1/github/callback"
+  FunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt GitHubSyncFunction.Arn

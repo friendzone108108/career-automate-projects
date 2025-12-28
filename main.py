@@ -17,6 +17,13 @@ from jose import jwt, JWTError
 from dotenv import load_dotenv
 import secrets
 
+# AWS Lambda handler adapter
+try:
+    from mangum import Mangum
+    LAMBDA_ENV = True
+except ImportError:
+    LAMBDA_ENV = False
+
 # Load environment variables
 load_dotenv()
 
@@ -982,6 +989,11 @@ async def health_check():
 # ============================================================================
 # Run Server
 # ============================================================================
+
+# AWS Lambda handler
+if LAMBDA_ENV:
+    handler = Mangum(app, lifespan="off")
+
 if __name__ == "__main__":
     import uvicorn
     
