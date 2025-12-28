@@ -29,6 +29,28 @@ JWT_SECRET = os.getenv("JWT_SECRET", "your_super_secret_key_here_123")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 DEV_GEMINI_API_KEY = os.getenv("DEV_GEMINI_API_KEY")
 
+# Groq API for free genre detection
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Genre categories
+GENRE_CATEGORIES = [
+    "web-development",
+    "mobile-app", 
+    "machine-learning",
+    "data-science",
+    "devops",
+    "game-development",
+    "backend",
+    "frontend",
+    "api",
+    "automation",
+    "cli-tool",
+    "library",
+    "blockchain",
+    "iot",
+    "other"
+]
+
 # GitHub App Configuration
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
@@ -100,6 +122,10 @@ class VideoSignedUrlRequest(BaseModel):
 class VideoSignedUrlResponse(BaseModel):
     upload_url: str
     storage_path: str
+
+class GenreResponse(BaseModel):
+    genres: List[str]
+    detected_at: str
 
 # ============================================================================
 # Authentication Dependency
@@ -192,7 +218,7 @@ Project README:
 {readme_content[:8000]}"""
         
         response = client.models.generate_content(
-            model='gemini-2.5-flash-preview-05-20',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         
@@ -224,6 +250,106 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
     ).hexdigest()
     
     return hmac.compare_digest(expected_sig, signature)
+
+async def detect_project_genres(readme_content: str) -> List[str]:
+    """Detect project genres using Groq API (free tier)."""
+    if not GROQ_API_KEY:
+        # Fallback to simple keyword-based detection
+        return detect_genres_simple(readme_content)
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": f"You are a project classifier. Analyze the README and return ONLY 2 genres from this list: {', '.join(GENRE_CATEGORIES)}. Return just the genre names separated by comma, nothing else."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Classify this project:\n\n{readme_content[:4000]}"
+                        }
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 50
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                genres_text = data["choices"][0]["message"]["content"].strip().lower()
+                # Parse genres
+                genres = [g.strip() for g in genres_text.split(",")]
+                # Filter to only valid genres
+                valid_genres = [g for g in genres if g in GENRE_CATEGORIES][:2]
+                return valid_genres if valid_genres else ["other"]
+            else:
+                return detect_genres_simple(readme_content)
+                
+    except Exception as e:
+        print(f"Groq API error: {str(e)}")
+        return detect_genres_simple(readme_content)
+
+def detect_genres_simple(readme_content: str) -> List[str]:
+    """Simple keyword-based genre detection as fallback."""
+    content_lower = readme_content.lower()
+    detected = []
+    
+    # Web development
+    web_keywords = ["react", "vue", "angular", "next.js", "html", "css", "frontend", "web app", "tailwind", "bootstrap"]
+    if any(kw in content_lower for kw in web_keywords):
+        detected.append("web-development")
+    
+    # Mobile app
+    mobile_keywords = ["react native", "flutter", "swift", "kotlin", "android", "ios", "mobile app"]
+    if any(kw in content_lower for kw in mobile_keywords):
+        detected.append("mobile-app")
+    
+    # Machine Learning
+    ml_keywords = ["tensorflow", "pytorch", "keras", "machine learning", "neural network", "deep learning", "model training"]
+    if any(kw in content_lower for kw in ml_keywords):
+        detected.append("machine-learning")
+    
+    # Data Science
+    ds_keywords = ["pandas", "numpy", "data analysis", "jupyter", "visualization", "matplotlib", "data science"]
+    if any(kw in content_lower for kw in ds_keywords):
+        detected.append("data-science")
+    
+    # DevOps
+    devops_keywords = ["docker", "kubernetes", "ci/cd", "terraform", "ansible", "devops", "aws", "azure", "gcp"]
+    if any(kw in content_lower for kw in devops_keywords):
+        detected.append("devops")
+    
+    # Backend
+    backend_keywords = ["fastapi", "express", "django", "flask", "node.js", "api", "rest", "graphql", "server"]
+    if any(kw in content_lower for kw in backend_keywords):
+        detected.append("backend")
+    
+    # API
+    api_keywords = ["api", "rest", "graphql", "endpoint", "microservice"]
+    if any(kw in content_lower for kw in api_keywords):
+        detected.append("api")
+    
+    # Automation
+    auto_keywords = ["automation", "bot", "scraper", "script", "cronjob"]
+    if any(kw in content_lower for kw in auto_keywords):
+        detected.append("automation")
+    
+    # Game development
+    game_keywords = ["unity", "unreal", "godot", "game", "pygame", "phaser"]
+    if any(kw in content_lower for kw in game_keywords):
+        detected.append("game-development")
+    
+    # Return top 2 or 'other' if none found
+    return detected[:2] if detected else ["other"]
 
 # ============================================================================
 # GitHub OAuth Endpoints
@@ -376,14 +502,23 @@ async def sync_projects(
         
         repos = response.json()
     
-    # Sync each repository
+    # Sync each repository with README content
     synced_count = 0
+    readme_fetched_count = 0
+    
     for repo in repos:
         try:
+            repo_name = repo["name"]
+            owner = repo["full_name"].split("/")[0]
+            
+            # Check if repo already exists with README content
+            existing = supabase.table("repositories").select("id, readme_content, readme_last_fetched_at").eq("user_id", user_id).eq("provider_repo_id", repo["id"]).execute()
+            
+            # Prepare base repo data
             repo_data = {
                 "user_id": user_id,
                 "provider_repo_id": repo["id"],
-                "name": repo["name"],
+                "name": repo_name,
                 "full_name": repo["full_name"],
                 "html_url": repo["html_url"],
                 "description": repo["description"],
@@ -398,6 +533,22 @@ async def sync_projects(
                 "sync_status": "synced"
             }
             
+            # If repo doesn't exist or doesn't have README content, fetch it
+            should_fetch_readme = True
+            if existing.data and len(existing.data) > 0:
+                existing_repo = existing.data[0]
+                # Only fetch README if it doesn't exist yet
+                if existing_repo.get("readme_content"):
+                    should_fetch_readme = False
+            
+            if should_fetch_readme:
+                readme_content = await fetch_readme_content(owner, repo_name, access_token)
+                if readme_content:
+                    repo_data["readme_content"] = readme_content[:15000]  # Store up to 15KB
+                    repo_data["readme_last_fetched_at"] = datetime.now(timezone.utc).isoformat()
+                    readme_fetched_count += 1
+            
+            # Upsert repository (won't create duplicates due to UNIQUE constraint)
             supabase.table("repositories").upsert(
                 repo_data,
                 on_conflict="user_id,provider_repo_id"
@@ -411,7 +562,7 @@ async def sync_projects(
     
     return SyncResponse(
         success=True,
-        message=f"Successfully synced {synced_count} repositories",
+        message=f"Synced {synced_count} repositories. Fetched README for {readme_fetched_count} new repos.",
         synced_count=synced_count
     )
 
@@ -450,10 +601,16 @@ async def describe_project(
     request: DescribeRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Generate AI description for a project."""
+    """
+    Generate AI description for a project.
+    
+    Uses stored README content from database first.
+    Only fetches from GitHub if README is not in database.
+    Stores both README and AI description for future use.
+    """
     user_id = current_user["user_id"]
     
-    # Get repository
+    # Get repository with all fields
     repo = supabase.table("repositories").select("*").eq("id", repo_id).eq("user_id", user_id).single().execute()
     
     if not repo.data:
@@ -463,34 +620,219 @@ async def describe_project(
     if repo.data.get("description_ai") and not request.regenerate:
         return DescribeResponse(description_ai=repo.data["description_ai"])
     
-    # Get GitHub integration for access token
-    integration = supabase.table("github_integrations").select("access_token").eq("user_id", user_id).single().execute()
+    # Try to use stored README content first
+    readme_content = repo.data.get("readme_content")
     
-    if not integration.data:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GitHub not connected")
-    
-    # Fetch README
-    owner = repo.data["full_name"].split("/")[0]
-    readme_content = await fetch_readme_content(owner, repo.data["name"], integration.data["access_token"])
-    
+    # If no stored README, fetch from GitHub
     if not readme_content:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No README found in this repository"
-        )
+        # Get GitHub integration for access token
+        integration = supabase.table("github_integrations").select("access_token").eq("user_id", user_id).single().execute()
+        
+        if not integration.data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GitHub not connected")
+        
+        owner = repo.data["full_name"].split("/")[0]
+        readme_content = await fetch_readme_content(owner, repo.data["name"], integration.data["access_token"])
+        
+        if not readme_content:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No README found in this repository"
+            )
+        
+        # Store the fetched README for future use
+        supabase.table("repositories").update({
+            "readme_content": readme_content[:15000],
+            "readme_last_fetched_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", repo_id).execute()
     
     # Get Gemini API key and generate summary
     gemini_key = get_gemini_api_key(user_id)
     ai_summary = generate_ai_summary(readme_content, gemini_key)
     
-    # Update repository
+    # Update repository with AI description
     supabase.table("repositories").update({
-        "description_ai": ai_summary,
-        "readme_content": readme_content[:10000],
-        "readme_last_fetched_at": datetime.now(timezone.utc).isoformat()
+        "description_ai": ai_summary
     }).eq("id", repo_id).execute()
     
     return DescribeResponse(description_ai=ai_summary)
+
+@app.post("/v1/projects/generate-all-descriptions")
+async def generate_all_descriptions(
+    current_user: dict = Depends(get_current_user),
+    limit: int = Query(10, ge=1, le=50, description="Max repos to process")
+):
+    """
+    Generate AI descriptions for all repos that have README but no AI description.
+    
+    This is a batch operation - use with caution as it consumes Gemini API quota.
+    Processes repos without description_ai but with readme_content.
+    """
+    user_id = current_user["user_id"]
+    
+    # Get repos with README but without AI description
+    repos = supabase.table("repositories").select(
+        "id, name, readme_content"
+    ).eq("user_id", user_id).is_("description_ai", "null").not_.is_("readme_content", "null").limit(limit).execute()
+    
+    if not repos.data or len(repos.data) == 0:
+        return {
+            "success": True,
+            "message": "No repositories need AI descriptions",
+            "processed_count": 0,
+            "results": []
+        }
+    
+    # Get Gemini API key once
+    gemini_key = get_gemini_api_key(user_id)
+    
+    results = []
+    processed_count = 0
+    
+    for repo in repos.data:
+        try:
+            readme_content = repo.get("readme_content")
+            if not readme_content:
+                continue
+            
+            # Generate AI summary
+            ai_summary = generate_ai_summary(readme_content, gemini_key)
+            
+            # Update repository
+            supabase.table("repositories").update({
+                "description_ai": ai_summary
+            }).eq("id", repo["id"]).execute()
+            
+            results.append({
+                "id": repo["id"],
+                "name": repo["name"],
+                "status": "success",
+                "description_ai": ai_summary[:200] + "..." if len(ai_summary) > 200 else ai_summary
+            })
+            processed_count += 1
+            
+        except HTTPException as e:
+            # Stop on quota exceeded
+            if e.status_code == 429:
+                results.append({
+                    "id": repo["id"],
+                    "name": repo["name"],
+                    "status": "quota_exceeded",
+                    "error": str(e.detail)
+                })
+                break
+        except Exception as e:
+            results.append({
+                "id": repo["id"],
+                "name": repo["name"],
+                "status": "error",
+                "error": str(e)
+            })
+    
+    return {
+        "success": True,
+        "message": f"Generated AI descriptions for {processed_count} repositories",
+        "processed_count": processed_count,
+        "results": results
+    }
+
+@app.get("/v1/projects/for-resume")
+async def get_projects_for_resume(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all projects ready for resume generation.
+    
+    Returns repos that have AI descriptions generated.
+    This endpoint is designed for the Resume Generation Stack to consume.
+    """
+    user_id = current_user["user_id"]
+    
+    # Get repos with AI descriptions
+    repos = supabase.table("repositories").select(
+        "id, name, full_name, html_url, description, description_ai, language, topics, stars_count"
+    ).eq("user_id", user_id).not_.is_("description_ai", "null").order("stars_count", desc=True).execute()
+    
+    return {
+        "success": True,
+        "count": len(repos.data) if repos.data else 0,
+        "projects": repos.data or []
+    }
+
+@app.get("/v1/projects/{repo_id}/readme")
+async def get_project_readme(
+    repo_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get the stored README content for a project.
+    
+    Returns the README content stored in database.
+    Useful for resume generation or other processing.
+    """
+    user_id = current_user["user_id"]
+    
+    repo = supabase.table("repositories").select(
+        "id, name, readme_content, readme_last_fetched_at"
+    ).eq("id", repo_id).eq("user_id", user_id).single().execute()
+    
+    if not repo.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found")
+    
+    if not repo.data.get("readme_content"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="README content not available. Please sync repositories first."
+        )
+    
+    return {
+        "success": True,
+        "repo_id": repo_id,
+        "name": repo.data["name"],
+        "readme_content": repo.data["readme_content"],
+        "last_fetched_at": repo.data.get("readme_last_fetched_at")
+    }
+
+@app.post("/v1/projects/{repo_id}/detect-genre", response_model=GenreResponse)
+async def detect_project_genre(
+    repo_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Detect project genres using AI (Groq) or keyword fallback.
+    
+    Returns up to 2 genres for the project.
+    Uses free Groq API if available, otherwise falls back to keyword detection.
+    """
+    user_id = current_user["user_id"]
+    
+    # Get repository
+    repo = supabase.table("repositories").select(
+        "id, name, readme_content, genres"
+    ).eq("id", repo_id).eq("user_id", user_id).single().execute()
+    
+    if not repo.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found")
+    
+    # Check if README exists
+    readme_content = repo.data.get("readme_content")
+    if not readme_content:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="README content not available. Please sync repositories first."
+        )
+    
+    # Detect genres
+    genres = await detect_project_genres(readme_content)
+    detected_at = datetime.now(timezone.utc).isoformat()
+    
+    # Store in database
+    supabase.table("repositories").update({
+        "genres": genres,
+        "genre_detected_at": detected_at
+    }).eq("id", repo_id).execute()
+    
+    return GenreResponse(genres=genres, detected_at=detected_at)
 
 @app.post("/v1/projects/{repo_id}/video/signed-url", response_model=VideoSignedUrlResponse)
 async def get_video_signed_url(
