@@ -464,6 +464,9 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
 # Minimum description length to store a repo without README
 MIN_DESCRIPTION_LENGTH = 500
 
+# Manual sync cooldown (in seconds)
+MANUAL_SYNC_COOLDOWN_SECONDS = 180  # 3 minutes
+
 @app.post("/v1/projects/sync", response_model=SyncResponse)
 async def sync_projects(
     current_user: dict = Depends(get_current_user),
@@ -477,8 +480,35 @@ async def sync_projects(
     2. Has a description longer than 500 characters
     
     Repositories not meeting these criteria are skipped.
+    
+    Rate Limited: 3-minute cooldown between manual syncs.
     """
     user_id = current_user["user_id"]
+    
+    # Check cooldown for manual sync
+    profile = supabase.table("profiles").select("last_sync_at").eq("id", user_id).single().execute()
+    
+    if profile.data and profile.data.get("last_sync_at"):
+        try:
+            last_sync_time = datetime.fromisoformat(profile.data["last_sync_at"].replace('Z', '+00:00'))
+            now = datetime.now(timezone.utc)
+            seconds_since_sync = (now - last_sync_time).total_seconds()
+            
+            if seconds_since_sync < MANUAL_SYNC_COOLDOWN_SECONDS:
+                remaining = int(MANUAL_SYNC_COOLDOWN_SECONDS - seconds_since_sync)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Please wait {remaining} seconds before syncing again. Cooldown: 3 minutes."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Error parsing last_sync_at: {e}")
+    
+    # Update last_sync_at immediately to prevent concurrent syncs
+    supabase.table("profiles").update({
+        "last_sync_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", user_id).execute()
     
     # Get GitHub integration
     integration = supabase.table("github_integrations").select("*").eq("user_id", user_id).single().execute()
@@ -936,7 +966,7 @@ async def get_video_status(
 # ============================================================================
 
 # Debounce interval for push events (in seconds)
-WEBHOOK_DEBOUNCE_SECONDS = 300  # 5 minutes
+WEBHOOK_DEBOUNCE_SECONDS = 900  # 15 minutes
 
 @app.post("/v1/github/webhook")
 async def github_webhook(
