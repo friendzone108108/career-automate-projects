@@ -4,7 +4,7 @@ Description: GitHub Sync Service - CareerAutomate
 
 Globals:
   Function:
-    Timeout: 30
+    Timeout: 120
     Runtime: python3.11
     MemorySize: 512
 
@@ -38,6 +38,9 @@ Parameters:
   FrontendUrl:
     Type: String
     Default: https://career-automate.vercel.app
+  ServiceUrl:
+    Type: String
+    Description: The API Gateway URL for this service (for OAuth callbacks)
 
 Resources:
   GitHubSyncFunction:
@@ -59,7 +62,7 @@ Resources:
           GITHUB_CLIENT_SECRET: !Ref GitHubClientSecret
           GITHUB_WEBHOOK_SECRET: !Ref GitHubWebhookSecret
           FRONTEND_URL: !Ref FrontendUrl
-          # SERVICE_URL is set dynamically based on the API event
+          SERVICE_URL: !Ref ServiceUrl
       Events:
         CatchAll:
           Type: Api

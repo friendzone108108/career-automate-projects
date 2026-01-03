@@ -460,12 +460,24 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
 # ============================================================================
 # Projects Endpoints
 # ============================================================================
+
+# Minimum description length to store a repo without README
+MIN_DESCRIPTION_LENGTH = 500
+
 @app.post("/v1/projects/sync", response_model=SyncResponse)
 async def sync_projects(
     current_user: dict = Depends(get_current_user),
     background_tasks: BackgroundTasks = None
 ):
-    """Sync repositories from GitHub."""
+    """
+    Sync repositories from GitHub.
+    
+    Only stores repositories that meet ONE of these criteria:
+    1. Has a README.md file
+    2. Has a description longer than 500 characters
+    
+    Repositories not meeting these criteria are skipped.
+    """
     user_id = current_user["user_id"]
     
     # Get GitHub integration
@@ -480,55 +492,96 @@ async def sync_projects(
     access_token = integration.data["access_token"]
     github_username = integration.data["github_username"]
     
-    # Fetch repositories from GitHub
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://api.github.com/user/repos",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/vnd.github.v3+json"
-            },
-            params={
-                "type": "owner",
-                "sort": "updated",
-                "per_page": 100
-            }
-        )
-        
-        if response.status_code == 401:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="GitHub token expired. Please reconnect your GitHub account."
-            )
-        
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to fetch repositories from GitHub"
-            )
-        
-        repos = response.json()
+    # Fetch ALL repositories from GitHub (including pagination)
+    all_repos = []
+    page = 1
     
-    # Sync each repository with README content
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            response = await client.get(
+                "https://api.github.com/user/repos",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                params={
+                    "type": "owner",
+                    "sort": "updated",
+                    "per_page": 100,
+                    "page": page
+                }
+            )
+            
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="GitHub token expired. Please reconnect your GitHub account."
+                )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Failed to fetch repositories from GitHub"
+                )
+            
+            repos_page = response.json()
+            if not repos_page:
+                break
+            
+            all_repos.extend(repos_page)
+            
+            # Check if there are more pages
+            if len(repos_page) < 100:
+                break
+            page += 1
+    
+    # Sync each repository - ONLY if it has README or long description
     synced_count = 0
+    skipped_count = 0
     readme_fetched_count = 0
+    total_fetched = len(all_repos)
     
-    for repo in repos:
+    for repo in all_repos:
         try:
             repo_name = repo["name"]
             owner = repo["full_name"].split("/")[0]
+            description = repo.get("description") or ""
             
-            # Check if repo already exists with README content
-            existing = supabase.table("repositories").select("id, readme_content, readme_last_fetched_at").eq("user_id", user_id).eq("provider_repo_id", repo["id"]).execute()
+            # Check if repo already exists
+            existing = supabase.table("repositories").select(
+                "id, readme_content, readme_last_fetched_at"
+            ).eq("user_id", user_id).eq("provider_repo_id", repo["id"]).execute()
             
-            # Prepare base repo data
+            existing_readme = None
+            if existing.data and len(existing.data) > 0:
+                existing_readme = existing.data[0].get("readme_content")
+            
+            # Try to fetch README if we don't have it cached
+            readme_content = None
+            if not existing_readme:
+                readme_content = await fetch_readme_content(owner, repo_name, access_token)
+                if readme_content:
+                    readme_fetched_count += 1
+            else:
+                readme_content = existing_readme
+            
+            # FILTER: Only store if has README OR description > 500 chars
+            has_readme = bool(readme_content)
+            has_long_description = len(description) >= MIN_DESCRIPTION_LENGTH
+            
+            if not has_readme and not has_long_description:
+                print(f"Skipping repo '{repo_name}': No README and description too short ({len(description)} chars)")
+                skipped_count += 1
+                continue
+            
+            # Prepare repo data
             repo_data = {
                 "user_id": user_id,
                 "provider_repo_id": repo["id"],
                 "name": repo_name,
                 "full_name": repo["full_name"],
                 "html_url": repo["html_url"],
-                "description": repo["description"],
+                "description": description,
                 "default_branch": repo.get("default_branch", "main"),
                 "language": repo.get("language"),
                 "topics": repo.get("topics", []),
@@ -540,22 +593,12 @@ async def sync_projects(
                 "sync_status": "synced"
             }
             
-            # If repo doesn't exist or doesn't have README content, fetch it
-            should_fetch_readme = True
-            if existing.data and len(existing.data) > 0:
-                existing_repo = existing.data[0]
-                # Only fetch README if it doesn't exist yet
-                if existing_repo.get("readme_content"):
-                    should_fetch_readme = False
+            # Add README content if available
+            if readme_content and not existing_readme:
+                repo_data["readme_content"] = readme_content[:15000]  # Store up to 15KB
+                repo_data["readme_last_fetched_at"] = datetime.now(timezone.utc).isoformat()
             
-            if should_fetch_readme:
-                readme_content = await fetch_readme_content(owner, repo_name, access_token)
-                if readme_content:
-                    repo_data["readme_content"] = readme_content[:15000]  # Store up to 15KB
-                    repo_data["readme_last_fetched_at"] = datetime.now(timezone.utc).isoformat()
-                    readme_fetched_count += 1
-            
-            # Upsert repository (won't create duplicates due to UNIQUE constraint)
+            # Upsert repository
             supabase.table("repositories").upsert(
                 repo_data,
                 on_conflict="user_id,provider_repo_id"
@@ -569,7 +612,7 @@ async def sync_projects(
     
     return SyncResponse(
         success=True,
-        message=f"Synced {synced_count} repositories. Fetched README for {readme_fetched_count} new repos.",
+        message=f"Synced {synced_count}/{total_fetched} repositories (skipped {skipped_count} without README or sufficient description). README fetched for {readme_fetched_count} repos.",
         synced_count=synced_count
     )
 
@@ -891,6 +934,10 @@ async def get_video_status(
 # ============================================================================
 # Webhook Endpoint
 # ============================================================================
+
+# Debounce interval for push events (in seconds)
+WEBHOOK_DEBOUNCE_SECONDS = 300  # 5 minutes
+
 @app.post("/v1/github/webhook")
 async def github_webhook(
     request: Request,
@@ -899,7 +946,14 @@ async def github_webhook(
     x_github_event: Optional[str] = Header(None),
     x_github_delivery: Optional[str] = Header(None)
 ):
-    """Handle GitHub webhook events."""
+    """
+    Handle GitHub webhook events with rate limiting.
+    
+    For push events:
+    - Debounces updates (ignores if last sync was < 5 minutes ago)
+    - Only marks as pending, doesn't fetch immediately
+    - Actual sync happens when user clicks "Sync Repos"
+    """
     payload = await request.body()
     
     # Verify signature
@@ -928,7 +982,7 @@ async def github_webhook(
     
     # Process event based on type
     if x_github_event == "push":
-        # Repository was pushed to - might want to refresh README
+        # Repository was pushed to - apply debouncing
         repo_data = data.get("repository", {})
         sender = data.get("sender", {})
         
@@ -936,11 +990,40 @@ async def github_webhook(
         integration = supabase.table("github_integrations").select("user_id").eq("github_user_id", sender.get("id")).single().execute()
         
         if integration.data:
-            # Update the repository's sync status
-            supabase.table("repositories").update({
-                "sync_status": "pending",
-                "last_synced_at": datetime.now(timezone.utc).isoformat()
-            }).eq("provider_repo_id", repo_data.get("id")).eq("user_id", integration.data["user_id"]).execute()
+            user_id = integration.data["user_id"]
+            provider_repo_id = repo_data.get("id")
+            
+            # Check last sync time for debouncing
+            existing_repo = supabase.table("repositories").select(
+                "id, last_synced_at, sync_status"
+            ).eq("provider_repo_id", provider_repo_id).eq("user_id", user_id).single().execute()
+            
+            should_update = True
+            
+            if existing_repo.data:
+                last_synced = existing_repo.data.get("last_synced_at")
+                if last_synced:
+                    try:
+                        last_sync_time = datetime.fromisoformat(last_synced.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        seconds_since_sync = (now - last_sync_time).total_seconds()
+                        
+                        # If last sync was less than debounce interval, skip this update
+                        if seconds_since_sync < WEBHOOK_DEBOUNCE_SECONDS:
+                            should_update = False
+                            print(f"Debouncing webhook for repo {repo_data.get('name')}: {int(seconds_since_sync)}s since last sync")
+                    except Exception as e:
+                        print(f"Error parsing last_synced_at: {e}")
+            
+            if should_update:
+                # Update the repository's sync status (marks as needing sync)
+                # But DON'T fetch README or generate AI - user must click Sync
+                supabase.table("repositories").update({
+                    "sync_status": "pending",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }).eq("provider_repo_id", provider_repo_id).eq("user_id", user_id).execute()
+                
+                print(f"Marked repo '{repo_data.get('name')}' as pending sync")
     
     elif x_github_event == "repository":
         action = data.get("action")
@@ -951,7 +1034,7 @@ async def github_webhook(
         
         if integration.data:
             if action == "created":
-                # New repository - add it
+                # New repository - add it (minimal data, README fetched on sync)
                 new_repo = {
                     "user_id": integration.data["user_id"],
                     "provider_repo_id": repo_data["id"],
@@ -963,13 +1046,19 @@ async def github_webhook(
                     "language": repo_data.get("language"),
                     "is_private": repo_data.get("private", False),
                     "last_synced_at": datetime.now(timezone.utc).isoformat(),
-                    "sync_status": "synced"
+                    "sync_status": "pending"  # User must sync to get README
                 }
                 supabase.table("repositories").upsert(new_repo, on_conflict="user_id,provider_repo_id").execute()
                 
             elif action == "deleted":
-                # Repository deleted - remove it
-                supabase.table("repositories").delete().eq("provider_repo_id", repo_data["id"]).eq("user_id", integration.data["user_id"]).execute()
+                # Repository deleted - remove it and associated videos
+                repo_to_delete = supabase.table("repositories").select("id").eq("provider_repo_id", repo_data["id"]).eq("user_id", integration.data["user_id"]).single().execute()
+                
+                if repo_to_delete.data:
+                    # Delete associated videos first
+                    supabase.table("project_videos").delete().eq("repo_id", repo_to_delete.data["id"]).execute()
+                    # Then delete the repository
+                    supabase.table("repositories").delete().eq("id", repo_to_delete.data["id"]).execute()
     
     return {"received": True}
 
