@@ -362,17 +362,26 @@ def detect_genres_simple(readme_content: str) -> List[str]:
 # GitHub OAuth Endpoints
 # ============================================================================
 @app.get("/v1/github/authorize")
-async def github_authorize(user_id: str = Query(...)):
-    """Initiate GitHub OAuth flow."""
+async def github_authorize(user_id: str = Query(...), redirect_to: str = Query("/projects")):
+    """Initiate GitHub OAuth flow.
+    
+    Args:
+        user_id: The Supabase user ID
+        redirect_to: The path to redirect to after OAuth (default: /projects)
+    """
     if not GITHUB_CLIENT_ID:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="GitHub App not configured. Set GITHUB_CLIENT_ID."
         )
     
-    # Generate state token
+    # Generate state token - store redirect_to along with user_id
     state = secrets.token_urlsafe(32)
-    oauth_states[state] = {"user_id": user_id, "created_at": datetime.now(timezone.utc)}
+    oauth_states[state] = {
+        "user_id": user_id, 
+        "redirect_to": redirect_to,
+        "created_at": datetime.now(timezone.utc)
+    }
     
     # Build GitHub OAuth URL
     scopes = "read:user,repo"
@@ -389,18 +398,28 @@ async def github_authorize(user_id: str = Query(...)):
 @app.get("/v1/github/callback")
 async def github_callback(code: str = Query(None), state: str = Query(None), error: str = Query(None)):
     """Handle GitHub OAuth callback."""
+    # Default redirect path if state is invalid
+    redirect_path = "/projects"
+    
+    # Try to get redirect path from state first
+    state_data = oauth_states.get(state) if state else None
+    if state_data:
+        redirect_path = state_data.get("redirect_to", "/projects")
+    
     if error:
-        return RedirectResponse(f"{FRONTEND_URL}/projects?error={error}")
+        oauth_states.pop(state, None)  # Clean up state
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error={error}")
     
     if not code or not state:
-        return RedirectResponse(f"{FRONTEND_URL}/projects?error=Missing+code+or+state")
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=Missing+code+or+state")
     
-    # Validate state
+    # Validate and consume state
     state_data = oauth_states.pop(state, None)
     if not state_data:
-        return RedirectResponse(f"{FRONTEND_URL}/projects?error=Invalid+state")
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=Invalid+state")
     
     user_id = state_data["user_id"]
+    redirect_path = state_data.get("redirect_to", "/projects")
     
     try:
         # Exchange code for access token
@@ -419,7 +438,7 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
             token_data = token_response.json()
             
             if "error" in token_data:
-                return RedirectResponse(f"{FRONTEND_URL}/projects?error={token_data.get('error_description', 'OAuth failed')}")
+                return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error={token_data.get('error_description', 'OAuth failed')}")
             
             access_token = token_data.get("access_token")
             refresh_token = token_data.get("refresh_token")
@@ -451,11 +470,11 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
             on_conflict="user_id"
         ).execute()
         
-        return RedirectResponse(f"{FRONTEND_URL}/projects?github_connected=true")
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_connected=true")
         
     except Exception as e:
         print(f"GitHub OAuth error: {str(e)}")
-        return RedirectResponse(f"{FRONTEND_URL}/projects?error=OAuth+failed")
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=OAuth+failed")
 
 # ============================================================================
 # Projects Endpoints
