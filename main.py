@@ -382,11 +382,12 @@ async def github_authorize(user_id: str = Query(...), redirect_to: str = Query("
         supabase.table("oauth_states").delete().lt("expires_at", datetime.now(timezone.utc).isoformat()).execute()
         
         # Store new state in database
-        supabase.table("oauth_states").insert({
+        result = supabase.table("oauth_states").insert({
             "state": state,
             "user_id": user_id,
             "redirect_to": redirect_to
         }).execute()
+        print(f"OAuth state saved successfully for user {user_id}, state: {state[:20]}...")
     except Exception as e:
         print(f"Error storing OAuth state: {str(e)}")
         raise HTTPException(
@@ -416,10 +417,14 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
     state_data = None
     if state:
         try:
-            result = supabase.table("oauth_states").select("*").eq("state", state).single().execute()
-            state_data = result.data
-            if state_data:
+            # Don't use .single() as it throws error when 0 rows found
+            result = supabase.table("oauth_states").select("*").eq("state", state).execute()
+            if result.data and len(result.data) > 0:
+                state_data = result.data[0]
                 redirect_path = state_data.get("redirect_to", "/projects")
+                print(f"Found OAuth state for user: {state_data.get('user_id')}")
+            else:
+                print(f"OAuth state not found in database for state: {state[:20]}...")
         except Exception as e:
             print(f"Error fetching OAuth state: {str(e)}")
     
