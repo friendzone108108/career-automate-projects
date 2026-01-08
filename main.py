@@ -74,8 +74,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# State storage for OAuth (in production, use Redis)
-oauth_states: dict = {}
+# Note: OAuth states are now stored in database table 'oauth_states' for Lambda compatibility
 
 # ============================================================================
 # FastAPI App
@@ -375,13 +374,25 @@ async def github_authorize(user_id: str = Query(...), redirect_to: str = Query("
             detail="GitHub App not configured. Set GITHUB_CLIENT_ID."
         )
     
-    # Generate state token - store redirect_to along with user_id
+    # Generate state token and store in database (for Lambda compatibility)
     state = secrets.token_urlsafe(32)
-    oauth_states[state] = {
-        "user_id": user_id, 
-        "redirect_to": redirect_to,
-        "created_at": datetime.now(timezone.utc)
-    }
+    
+    try:
+        # Clean up expired states first
+        supabase.table("oauth_states").delete().lt("expires_at", datetime.now(timezone.utc).isoformat()).execute()
+        
+        # Store new state in database
+        supabase.table("oauth_states").insert({
+            "state": state,
+            "user_id": user_id,
+            "redirect_to": redirect_to
+        }).execute()
+    except Exception as e:
+        print(f"Error storing OAuth state: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to initiate OAuth flow"
+        )
     
     # Build GitHub OAuth URL
     scopes = "read:user,repo"
@@ -401,22 +412,38 @@ async def github_callback(code: str = Query(None), state: str = Query(None), err
     # Default redirect path if state is invalid
     redirect_path = "/projects"
     
-    # Try to get redirect path from state first
-    state_data = oauth_states.get(state) if state else None
-    if state_data:
-        redirect_path = state_data.get("redirect_to", "/projects")
+    # Try to get state data from database
+    state_data = None
+    if state:
+        try:
+            result = supabase.table("oauth_states").select("*").eq("state", state).single().execute()
+            state_data = result.data
+            if state_data:
+                redirect_path = state_data.get("redirect_to", "/projects")
+        except Exception as e:
+            print(f"Error fetching OAuth state: {str(e)}")
     
     if error:
-        oauth_states.pop(state, None)  # Clean up state
+        # Clean up state from database
+        if state:
+            try:
+                supabase.table("oauth_states").delete().eq("state", state).execute()
+            except Exception:
+                pass
         return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error={error}")
     
     if not code or not state:
         return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=Missing+code+or+state")
     
-    # Validate and consume state
-    state_data = oauth_states.pop(state, None)
+    # Validate state exists in database
     if not state_data:
-        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=Invalid+state")
+        return RedirectResponse(f"{FRONTEND_URL}{redirect_path}?github_error=Invalid+or+expired+state")
+    
+    # Delete state from database (consume it)
+    try:
+        supabase.table("oauth_states").delete().eq("state", state).execute()
+    except Exception:
+        pass
     
     user_id = state_data["user_id"]
     redirect_path = state_data.get("redirect_to", "/projects")
